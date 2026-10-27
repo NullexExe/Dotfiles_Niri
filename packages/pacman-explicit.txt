@@ -1,0 +1,4 @@
+# Historical snapshot of the source machine's explicitly installed packages.
+# The installer intentionally uses packages/pacman.txt instead.
+#
+# Kept for audit/reference only; it is not an installation manifest.

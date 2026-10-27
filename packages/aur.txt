@@ -1,0 +1,2 @@
+# No AUR packages are required by the rice.
+# Voxtype is downloaded from its official release and verified by SHA256.

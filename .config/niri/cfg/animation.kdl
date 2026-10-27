@@ -1,0 +1,35 @@
+    animations {
+        // Softer, slower settle. A little spring, no snap.
+        slowdown 1.2
+
+        workspace-switch {
+            spring damping-ratio=0.82 stiffness=650 epsilon=0.0001
+        }
+        window-open {
+            duration-ms 280
+            curve "ease-out-cubic"
+        }
+        window-close {
+            duration-ms 220
+            curve "ease-out-quad"
+        }
+        horizontal-view-movement {
+            spring damping-ratio=0.85 stiffness=600 epsilon=0.0001
+        }
+        window-movement {
+            spring damping-ratio=0.88 stiffness=620 epsilon=0.0001
+        }
+        window-resize {
+            spring damping-ratio=0.9 stiffness=700 epsilon=0.0001
+        }
+        config-notification-open-close {
+            spring damping-ratio=0.7 stiffness=800 epsilon=0.001
+        }
+        screenshot-ui-open {
+            duration-ms 260
+            curve "ease-out-quad"
+        }
+        overview-open-close {
+            spring damping-ratio=0.84 stiffness=620 epsilon=0.0001
+        }
+    }

@@ -1,0 +1,84 @@
+// ────────────── Window and layer rules ──────────────
+// https://github.com/YaLTeR/niri/wiki/Configuration:-Window-Rules
+
+// Base look for every window: rounded, fully opaque.
+// Blur and inactive dimming are deliberately off. With focus-follows-mouse they
+// made windows "glow" whenever the pointer crossed them.
+window-rule {
+    opacity 1.0
+    geometry-corner-radius 14
+    clip-to-geometry true
+
+    background-effect {
+        blur false
+        xray false
+    }
+
+    popups {
+        opacity 1.0
+        geometry-corner-radius 12
+        background-effect {
+            blur false
+            xray false
+        }
+    }
+}
+
+// ─── Noctalia ───
+
+// Settings open as a large floating window.
+window-rule {
+    match app-id="dev.noctalia.Noctalia"
+    open-floating true
+    default-column-width { fixed 1080; }
+    default-window-height { fixed 920; }
+}
+
+// Wallpaper lives in the backdrop so it also shows behind the overview.
+layer-rule {
+    match namespace="^noctalia-wallpaper"
+    place-within-backdrop true
+}
+
+layer-rule {
+    match namespace="^noctalia-(bar-[^\"]+|notification|dock|panel|attached-panel|osd)$"
+    background-effect {
+        xray false
+    }
+}
+
+// ─── Steam ───
+
+// Invisible helper windows and popups should not steal a tile.
+window-rule {
+    match app-id="steam" title="^$"
+    open-floating true
+    min-width 1
+    min-height 1
+}
+
+// Only the main library window is tiled; everything else floats.
+window-rule {
+    match app-id="steam"
+    exclude title=r#"^[Ss]team$"#
+    open-floating true
+}
+
+window-rule {
+    match app-id="steam" title=r#"^notificationtoasts_\d+_desktop$"#
+    default-floating-position x=10 y=10 relative-to="bottom-right"
+    open-focused false
+}
+
+// ─── Screencast privacy (Mod+Shift+X) ───
+
+// The hidden workspace that niri-cast-privacy parks blocked windows on.
+workspace "privacy"
+
+window-rule {
+    match title="niri-cast-privacy"
+    match app-id="dev.niri.cast-privacy"
+    open-on-workspace "privacy"
+    open-focused false
+    open-floating true
+}

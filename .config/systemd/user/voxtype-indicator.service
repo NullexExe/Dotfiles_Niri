@@ -1,0 +1,15 @@
+[Unit]
+Description=Voxtype dictation indicator
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+PartOf=graphical-session.target
+After=graphical-session.target voxtype.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u %h/.local/bin/voxtype-indicator
+Restart=always
+RestartSec=1
+Environment=GDK_BACKEND=wayland
+
+[Install]
+WantedBy=graphical-session.target

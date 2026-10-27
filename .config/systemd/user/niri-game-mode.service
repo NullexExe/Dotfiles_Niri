@@ -1,0 +1,15 @@
+[Unit]
+Description=Niri game mode: disable effects while a window covers an output
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/niri-game-mode --watch
+Restart=always
+RestartSec=2
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=graphical-session.target

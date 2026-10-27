@@ -1,0 +1,20 @@
+# Voxtype voice dictation. The language is chosen by install.sh from your
+# keyboard layouts; change it here any time ("auto" lets Whisper detect it).
+[hotkey]
+enabled = false      # the trigger is Mod+Shift+V, bound in niri
+mode = "toggle"
+
+[whisper]
+model = "large-v3-turbo"
+language = "@VOXTYPE_LANG@"
+translate = false
+on_demand_loading = true
+
+[output]
+mode = "paste"
+fallback_to_clipboard = true
+
+[output.notification]
+on_recording_start = false
+on_recording_stop = false
+on_transcription = true

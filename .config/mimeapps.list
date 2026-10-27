@@ -1,0 +1,14 @@
+[Default Applications]
+inode/directory=org.gnome.Nautilus.desktop
+x-directory/normal=org.gnome.Nautilus.desktop
+image/png=org.gnome.eog.desktop;
+image/jpeg=org.gnome.eog.desktop;
+image/webp=org.gnome.eog.desktop;
+text/plain=nvim.desktop;
+text/markdown=nvim.desktop;
+video/mp4=mpv.desktop;
+video/webm=mpv.desktop;
+video/x-matroska=mpv.desktop;
+audio/mpeg=mpv.desktop;
+audio/ogg=mpv.desktop;
+audio/flac=mpv.desktop;

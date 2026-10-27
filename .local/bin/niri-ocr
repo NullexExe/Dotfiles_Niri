@@ -1,0 +1,31 @@
+#!/bin/bash
+# Select a screen region and copy the recognised text to the clipboard.
+# Languages: every Tesseract language pack installed on the system (the
+# installer adds packs for your keyboard layouts). Override with
+#   NIRI_OCR_LANGS="rus+eng"   NIRI_OCR_PSM=6   TESSDATA_PREFIX=/path
+set -euo pipefail
+
+# A user-level tessdata dir wins, otherwise use the system one from pacman.
+if [ -z "${TESSDATA_PREFIX:-}" ]; then
+  for dir in "$HOME/.local/share/tessdata" /usr/share/tessdata /usr/share/tesseract-ocr/*/tessdata; do
+    [ -f "$dir/eng.traineddata" ] && { export TESSDATA_PREFIX="$dir"; break; }
+  done
+fi
+
+langs="${NIRI_OCR_LANGS:-}"
+if [ -z "$langs" ]; then
+  langs=$(tesseract --list-langs 2>/dev/null | tail -n +2 | grep -vx osd | paste -sd+ -)
+  langs="${langs:-eng}"
+fi
+
+geom=$(slurp) || exit 0
+tmp=$(mktemp --suffix=.png)
+trap 'rm -f "$tmp"' EXIT
+grim -g "$geom" "$tmp"
+text=$(tesseract "$tmp" stdout -l "$langs" --psm "${NIRI_OCR_PSM:-6}" 2>/dev/null | sed -e 's/[[:space:]]*$//' -e '/^$/d')
+if [ -z "$text" ]; then
+  notify-send -a OCR "OCR" "No text found"
+  exit 0
+fi
+printf '%s' "$text" | wl-copy
+notify-send -a OCR "OCR → clipboard" "$(printf '%s' "$text" | head -c 280)"

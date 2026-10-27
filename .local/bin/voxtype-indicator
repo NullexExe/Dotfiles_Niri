@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Voxtype indicator: dock-bottom for dictation; top call-beam for voice-agent."""
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import threading
+time = __import__("time")
+
+import cairo
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gdk, GLib, Gtk, GtkLayerShell  # noqa: E402
+
+LOG = "/tmp/voxtype-indicator.log"
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voxtype-indicator.lock")
+MODE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-agent.mode")
+SESSION_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-agent.session")
+UI_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-agent-ui.json")
+
+BOTTOM_MARGIN = 72
+TOP_MARGIN = 28
+SIZE_DICTATION = 110
+SIZE_AGENT = 120  # room for side beams
+
+SHOW = {"recording", "listening", "transcribing", "processing", "busy"}
+ACCENT = {
+    "recording": (0.95, 0.28, 0.35),
+    "listening": (0.95, 0.28, 0.35),
+    "transcribing": (0.35, 0.75, 1.0),
+    "processing": (0.35, 0.75, 1.0),
+    "busy": (0.95, 0.75, 0.30),
+}
+# agent call palette — violet → cyan
+AGENT_A = (0.72, 0.38, 1.0)
+AGENT_B = (0.30, 0.85, 1.0)
+
+
+def log(msg: str) -> None:
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def lock_is_ours() -> bool:
+    if not os.path.exists(LOCK):
+        return False
+    try:
+        pid = int(open(LOCK).read().strip() or "0")
+        cmdline = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "ignore")
+        return "voxtype-indicator" in cmdline
+    except Exception:
+        return False
+
+
+def acquire_lock() -> bool:
+    if lock_is_ours():
+        log("another instance alive")
+        return False
+    try:
+        os.unlink(LOCK)
+    except Exception:
+        pass
+    fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    os.write(fd, str(os.getpid()).encode())
+    os.close(fd)
+    return True
+
+
+class Dot(Gtk.Window):
+    def __init__(self, monitor: Gdk.Monitor):
+        super().__init__()
+        self.state = "idle"
+        self.phase = 0.0
+        self.agent = False
+        self.layout_agent = False
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_accept_focus(False)
+        self.set_can_focus(False)
+        self._apply_size(SIZE_DICTATION)
+
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_namespace(self, "voxtype-indicator")
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+        GtkLayerShell.set_monitor(self, monitor)
+        self._apply_layout(agent=False)
+
+        self.connect("draw", self.on_draw)
+        self.connect("realize", self.on_realize)
+        self.show_all()
+
+    def _apply_size(self, size: int):
+        self.set_size_request(size, size)
+        self.set_default_size(size, size)
+        try:
+            self.resize(size, size)
+        except Exception:
+            pass
+
+    def _apply_layout(self, agent: bool):
+        self.layout_agent = agent
+        # clear both anchors then set one
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, False)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, False)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, 0)
+        GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, 0)
+        if agent:
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.TOP, TOP_MARGIN)
+            self._apply_size(SIZE_AGENT)
+        else:
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
+            GtkLayerShell.set_margin(self, GtkLayerShell.Edge.BOTTOM, BOTTOM_MARGIN)
+            self._apply_size(SIZE_DICTATION)
+
+    def on_realize(self, *_):
+        win = self.get_window()
+        if win is None:
+            return
+        try:
+            win.set_pass_through(True)
+        except Exception:
+            pass
+        try:
+            # empty region = fully click-through
+            win.input_shape_combine_region(cairo.Region(), 0, 0)
+        except Exception:
+            try:
+                win.input_shape_combine_region(cairo.Region(cairo.RectangleInt(0, 0, 0, 0)), 0, 0)
+            except Exception:
+                pass
+
+    def set_state(self, state: str, agent: bool):
+        state = (state or "idle").lower()
+        changed = state != self.state or agent != self.agent
+        self.state = state
+        self.agent = agent
+        want_agent_layout = agent or (state in SHOW and self.layout_agent)
+        # stick to top while agent session active (recording/transcribing after flag)
+        if agent and state in SHOW:
+            want_agent_layout = True
+        if state == "idle" and not agent:
+            want_agent_layout = False
+        if want_agent_layout != self.layout_agent:
+            self._apply_layout(want_agent_layout)
+            log(f"layout {'agent-top' if want_agent_layout else 'dictation-bottom'}")
+        if changed:
+            log(f"state {state} agent={agent}")
+            self.queue_draw()
+        return False
+
+    def on_draw(self, _w, cr):
+        w = self.get_allocated_width()
+        h = self.get_allocated_height()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        if self.state not in SHOW:
+            return False
+
+        cx, cy = w / 2, h / 2
+        t = self.phase
+
+        if self.layout_agent:
+            self._draw_agent_call(cr, cx, cy, w, h, t)
+        else:
+            self._draw_dictation(cr, cx, cy, t)
+        return False
+
+    def _draw_dictation(self, cr, cx, cy, t):
+        accent = ACCENT.get(self.state, ACCENT["busy"])
+        recording = self.state in {"recording", "listening"}
+        breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 1.4))
+        glow_r = 34 + 6 * breath
+        cr.set_source_rgba(accent[0], accent[1], accent[2], 0.10 + 0.10 * breath)
+        cr.arc(cx, cy, glow_r, 0, 2 * math.pi)
+        cr.fill()
+
+        if recording:
+            for i in range(3):
+                u = (t * 0.22 + i / 3.0) % 1.0
+                r = 16 + u * 36
+                a = (1.0 - u) * 0.45
+                cr.set_line_width(2.2 - u * 1.2)
+                cr.set_source_rgba(accent[0], accent[1], accent[2], a)
+                cr.arc(cx, cy, r, 0, 2 * math.pi)
+                cr.stroke()
+        else:
+            spin = t * 2.2
+            cr.set_line_width(3.2)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_source_rgba(accent[0], accent[1], accent[2], 0.85)
+            cr.arc(cx, cy, 28, spin, spin + 1.7)
+            cr.stroke()
+            cr.set_source_rgba(accent[0], accent[1], accent[2], 0.28)
+            cr.arc(cx, cy, 28, spin + math.pi, spin + math.pi + 1.1)
+            cr.stroke()
+
+        body_r = 13 + (1.5 * breath if recording else 0.8)
+        cr.set_source_rgba(accent[0], accent[1], accent[2], 0.78 + 0.22 * breath)
+        cr.arc(cx, cy, body_r, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgba(1, 1, 1, 0.95)
+        cr.arc(cx, cy, 5.5, 0, 2 * math.pi)
+        cr.fill()
+
+    def _draw_agent_call(self, cr, cx, cy, w, h, t):
+        """Top call beacon: core + horizontal gradient beams that sweep outward."""
+        recording = self.state in {"recording", "listening"}
+        breath = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(t * 1.6))
+        # mix accent by phase for living gradient
+        mix = 0.5 + 0.5 * math.sin(t * 0.9)
+        ar = AGENT_A[0] * (1 - mix) + AGENT_B[0] * mix
+        ag = AGENT_A[1] * (1 - mix) + AGENT_B[1] * mix
+        ab = AGENT_A[2] * (1 - mix) + AGENT_B[2] * mix
+
+        # side beams — soft horizontal gradients left & right
+        beam_h = 18 + 10 * breath
+        beam_w = w * 0.48
+        sweep = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 1.1))
+
+        def beam(x0, x1, outward_sign):
+            # gradient along x; fade vertically with gaussian-ish strips
+            steps = 28
+            for i in range(steps):
+                u = i / (steps - 1)
+                x = x0 + (x1 - x0) * u
+                # color slides violet→cyan along beam
+                r = AGENT_A[0] * (1 - u) + AGENT_B[0] * u
+                g = AGENT_A[1] * (1 - u) + AGENT_B[1] * u
+                b = AGENT_A[2] * (1 - u) + AGENT_B[2] * u
+                # brighter near core, pulse travels outward
+                pulse = math.exp(-((u - (sweep % 1.0)) ** 2) / 0.04)
+                a = (1.0 - u) * 0.38 * breath + pulse * 0.35
+                cr.set_source_rgba(r, g, b, max(0.0, min(0.7, a)))
+                # thin vertical slice
+                yy = cy - beam_h * (0.35 + 0.65 * (1 - u))
+                hh = beam_h * 2 * (0.35 + 0.65 * (1 - u))
+                cr.rectangle(x, yy, max(2.0, abs(x1 - x0) / steps + 1), hh)
+                cr.fill()
+
+        beam(cx - 16, cx - beam_w, -1)
+        beam(cx + 16, cx + beam_w, 1)
+
+        # soft vertical glow above/below core
+        cr.set_source_rgba(ar, ag, ab, 0.14 * breath)
+        cr.arc(cx, cy, 48, 0, 2 * math.pi)
+        cr.fill()
+
+        if recording:
+            # call rings — elliptical hint of address
+            for i in range(3):
+                u = (t * 0.18 + i / 3.0) % 1.0
+                rx = 22 + u * 50
+                ry = 14 + u * 22
+                a = (1.0 - u) * 0.5
+                cr.save()
+                cr.translate(cx, cy)
+                cr.scale(1.0, ry / rx)
+                cr.set_line_width(2.0)
+                cr.set_source_rgba(ar, ag, ab, a)
+                cr.arc(0, 0, rx, 0, 2 * math.pi)
+                cr.stroke()
+                cr.restore()
+        else:
+            # processing — rotating crescent pair
+            spin = t * 2.4
+            cr.set_line_width(3.4)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_source_rgba(AGENT_B[0], AGENT_B[1], AGENT_B[2], 0.9)
+            cr.arc(cx, cy, 30, spin, spin + 1.8)
+            cr.stroke()
+            cr.set_source_rgba(AGENT_A[0], AGENT_A[1], AGENT_A[2], 0.55)
+            cr.arc(cx, cy, 30, spin + math.pi, spin + math.pi + 1.2)
+            cr.stroke()
+
+        # core jewel
+        body = 15 + 2.5 * breath
+        grad = cairo.RadialGradient(cx - 3, cy - 3, 2, cx, cy, body)
+        grad.add_color_stop_rgba(0.0, 1, 1, 1, 0.95)
+        grad.add_color_stop_rgba(0.35, ar, ag, ab, 0.95)
+        grad.add_color_stop_rgba(1.0, AGENT_A[0], AGENT_A[1], AGENT_A[2], 0.55)
+        cr.set_source(grad)
+        cr.arc(cx, cy, body, 0, 2 * math.pi)
+        cr.fill()
+
+
+class App:
+    def __init__(self):
+        self.dots: list[Dot] = []
+        self.phase = 0.0
+        self.state = "idle"
+        self.agent_sticky = False
+        display = Gdk.Display.get_default()
+        n = display.get_n_monitors()
+        # Only ONE monitor — prefer the primary landscape output, avoid duplicate UI
+        pick = display.get_primary_monitor()
+        best_score = -1
+        best = pick
+        for i in range(n):
+            m = display.get_monitor(i)
+            g = m.get_geometry()
+            score = g.width * g.height + (10_000_000 if g.width >= g.height else 0)
+            if score > best_score:
+                best_score = score
+                best = m
+        if pick is not None:
+            g = pick.get_geometry()
+            if g.width >= g.height:
+                best = pick
+        self.dots.append(Dot(best))
+        log(f"monitors={n} using_one={best.get_geometry().width}x{best.get_geometry().height}")
+        GLib.timeout_add(33, self._tick)
+        threading.Thread(target=self._follow, daemon=True).start()
+
+    def _agent_flag(self) -> bool:
+        if os.path.exists(MODE_FILE) or os.path.exists(SESSION_FILE):
+            return True
+        try:
+            import json
+            phase = json.loads(open(UI_FILE, encoding="utf-8").read()).get("phase", "idle")
+            return phase in {"listening", "thinking", "answer"}
+        except Exception:
+            return False
+
+    def _tick(self):
+        self.phase = (self.phase + 0.12) % (2 * math.pi * 10)
+        flag = self._agent_flag()
+        if flag:
+            self.agent_sticky = True
+        if self.state == "idle" and not flag:
+            self.agent_sticky = False
+        agent = flag or self.agent_sticky
+        for d in self.dots:
+            d.phase = self.phase
+            d.set_state(self.state, agent)
+            if d.state in SHOW:
+                d.queue_draw()
+        return True
+
+    def set_state(self, state: str):
+        self.state = (state or "idle").lower()
+        flag = self._agent_flag()
+        if flag:
+            self.agent_sticky = True
+        if self.state == "idle" and not flag:
+            self.agent_sticky = False
+        agent = flag or self.agent_sticky
+        for d in self.dots:
+            d.set_state(self.state, agent)
+        return False
+
+    def _follow(self):
+        while True:
+            try:
+                try:
+                    out = subprocess.check_output(
+                        ["voxtype", "status", "--format", "json"],
+                        text=True,
+                        stderr=subprocess.DEVNULL,
+                    ).strip()
+                    data = json.loads(out)
+                    st = (data.get("class") or data.get("alt") or "idle").lower()
+                    GLib.idle_add(self.set_state, st)
+                except Exception as e:
+                    log(f"seed status err: {e}")
+
+                proc = subprocess.Popen(
+                    ["voxtype", "status", "--follow", "--format", "json"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                log("follow started")
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        st = (data.get("class") or data.get("alt") or "idle").lower()
+                    except json.JSONDecodeError:
+                        st = line.lower()
+                    GLib.idle_add(self.set_state, st)
+                rc = proc.wait()
+                log(f"follow exited rc={rc}")
+            except Exception as e:
+                log(f"follow err: {e}")
+            time.sleep(0.6)
+
+
+def main() -> int:
+    open(LOG, "w", encoding="utf-8").write("boot\n")
+    if not acquire_lock():
+        print("already running", file=sys.stderr)
+        return 0
+
+    def cleanup(*_):
+        try:
+            os.unlink(LOCK)
+        except Exception:
+            pass
+        Gtk.main_quit()
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    App()
+    Gtk.main()
+    try:
+        os.unlink(LOCK)
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

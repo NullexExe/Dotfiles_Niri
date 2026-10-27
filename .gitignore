@@ -1,0 +1,38 @@
+# Secrets / junk
+*.env
+*.key
+*.pem
+.cache/
+.local/state/
+__pycache__/
+*.pyc
+*.log
+*.AppImage
+
+# Never commit an accidental nested home/repository copy
+/home/
+home/
+
+# Personal application state and credentials
+.config/gh/hosts.yml
+.config/*/Cookies*
+.config/*/Login Data*
+.config/*/History*
+.config/*/Session Storage/
+.config/*/Local Storage/
+.config/Bitwarden/
+.local/share/keyrings/
+.local/share/nautilus/tags/
+.local/share/voxtype/models/
+
+# Heavy / optional fonts (install separately)
+.local/share/fonts/SF-Pro/
+.local/share/fonts/SF-Pro/**
+
+# Voxtype binaries (the .config/voxtype/ settings are tracked)
+/.local/bin/voxtype
+/.local/bin/voxtype.real
+
+# Media not part of rice
+Videos/
+Pictures/Screenshots/

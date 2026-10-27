@@ -1,0 +1,13 @@
+// ────────────── Monitors ──────────────
+// Intentionally empty: Niri auto-detects outputs with sane defaults.
+// install.sh never overwrites this file once it exists.
+//
+// To set resolution, refresh rate, scale, rotation and position, either:
+//   • run `nwg-displays` (a GUI that rewrites this file for you), or
+//   • add blocks by hand. List your output names with `niri msg outputs`:
+//
+//   output "<name from niri msg outputs>" {
+//       mode "2560x1440@144.000"
+//       scale 1.0
+//       position x=0 y=0
+//   }

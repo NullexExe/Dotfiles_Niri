@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""Region screenshot with gravity ropes; always saves under Pictures/Screenshots."""
+from __future__ import annotations
+
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+import cairo
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+from gi.repository import Gdk, GLib, Gtk, GtkLayerShell  # noqa: E402
+
+OUTDIR = os.path.expanduser("~/Pictures/Screenshots")
+DIM = 0.35
+SEGMENTS_BORDER = 10
+SEGMENTS_TETHER = 12
+# Border around rect: slight hang. Tethers from monitor edges: visible catenary.
+GRAVITY_BORDER = 28.0
+GRAVITY_TETHER = 720.0
+DAMPING = 0.988
+SLACK_BORDER = 1.0  # rigid length; tiny motion from residual gravity
+GRAVITY_SIDE = 8.0   # left/right perimeter — almost cable-taut
+SLACK_SIDE = 1.0
+SLACK_TETHER = 1.06  # tighter corner tethers
+ROPE_WIDTH = 2.4
+ROPE_COLOR = (0.82, 0.68, 0.42, 1.0)
+ROPE_DARK = (0.45, 0.32, 0.18, 0.9)
+TETHER_COLOR = (0.78, 0.62, 0.36, 0.95)
+MIN_SIZE = 4
+GEOMETRY_ONLY = "--geometry" in sys.argv
+
+
+@dataclass
+class Particle:
+    x: float
+    y: float
+    px: float
+    py: float
+    pinned: bool = False
+
+
+@dataclass
+class Rope:
+    pts: list = field(default_factory=list)
+    rest: float = 1.0
+    gravity: float = GRAVITY_BORDER
+    kind: str = "border"  # border | tether
+
+
+def make_rope(x0, y0, x1, y1, n=SEGMENTS_BORDER, gravity=GRAVITY_BORDER, slack=SLACK_BORDER, kind="border") -> Rope:
+    pts = []
+    for i in range(n):
+        t = i / (n - 1)
+        x = x0 + (x1 - x0) * t
+        y = y0 + (y1 - y0) * t
+        pts.append(Particle(x, y, x, y, pinned=(i == 0 or i == n - 1)))
+    length = math.hypot(x1 - x0, y1 - y0)
+    rest = max(length / (n - 1), 1.0) * slack
+    return Rope(pts=pts, rest=rest, gravity=gravity, kind=kind)
+
+
+def update_rope_ends(rope: Rope, x0, y0, x1, y1, slack: float):
+    n = len(rope.pts)
+    length = math.hypot(x1 - x0, y1 - y0)
+    rope.rest = max(length / max(n - 1, 1), 1.0) * slack
+    rope.pts[0].x = rope.pts[0].px = x0
+    rope.pts[0].y = rope.pts[0].py = y0
+    rope.pts[-1].x = rope.pts[-1].px = x1
+    rope.pts[-1].y = rope.pts[-1].py = y1
+    rope.pts[0].pinned = rope.pts[-1].pinned = True
+
+
+def step_rope(rope: Rope, dt: float):
+    g = rope.gravity * dt * dt
+    damp = 0.92 if rope.kind == "border" else DAMPING
+    for p in rope.pts:
+        if p.pinned:
+            continue
+        vx = (p.x - p.px) * damp
+        vy = (p.y - p.py) * damp
+        p.px, p.py = p.x, p.y
+        p.x += vx
+        p.y += vy + g
+    iters = (10 if rope.gravity <= 10 else 6) if rope.kind == "border" else 4
+    for _ in range(iters):
+        for i in range(len(rope.pts) - 1):
+            a = rope.pts[i]
+            b = rope.pts[i + 1]
+            dx = b.x - a.x
+            dy = b.y - a.y
+            dist = math.hypot(dx, dy) or 0.0001
+            diff = (dist - rope.rest) / dist
+            if a.pinned and b.pinned:
+                continue
+            if a.pinned:
+                b.x -= dx * diff
+                b.y -= dy * diff
+            elif b.pinned:
+                a.x += dx * diff
+                a.y += dy * diff
+            else:
+                ox, oy = dx * 0.5 * diff, dy * 0.5 * diff
+                a.x += ox
+                a.y += oy
+                b.x -= ox
+                b.y -= oy
+
+
+class ScreenOverlay(Gtk.Window):
+    """One output-sized interactive layer."""
+
+    def __init__(self, app: "ScreenshotApp", monitor: Gdk.Monitor, geo):
+        super().__init__()
+        self.app = app
+        self.monitor = monitor
+        self.geo = geo  # Gdk.Rectangle
+        self.win_w = geo.width
+        self.win_h = geo.height
+
+        self.set_app_paintable(True)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_size_request(self.win_w, self.win_h)
+
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_namespace(self, "niri-screenshot-ropes")
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        # EXCLUSIVE only on primary overlay (set by app); default none here
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.NONE)
+        GtkLayerShell.set_exclusive_zone(self, -1)
+        GtkLayerShell.set_monitor(self, monitor)
+        for edge in (
+            GtkLayerShell.Edge.LEFT,
+            GtkLayerShell.Edge.TOP,
+            GtkLayerShell.Edge.RIGHT,
+            GtkLayerShell.Edge.BOTTOM,
+        ):
+            GtkLayerShell.set_anchor(self, edge, True)
+            GtkLayerShell.set_margin(self, edge, 0)
+
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.KEY_PRESS_MASK
+        )
+        self.connect("draw", self.on_draw)
+        self.connect("button-press-event", self.on_press)
+        self.connect("button-release-event", self.on_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("key-press-event", self.on_key)
+        self.set_can_focus(True)
+        self.show_all()
+        self.grab_focus()
+
+    def to_global(self, lx: float, ly: float):
+        return self.geo.x + lx, self.geo.y + ly
+
+    def on_press(self, _w, event):
+        if event.button != 1:
+            return False
+        gx, gy = self.to_global(event.x, event.y)
+        self.app.begin_drag(gx, gy)
+        return True
+
+    def on_motion(self, _w, event):
+        if not self.app.dragging:
+            return False
+        gx, gy = self.to_global(event.x, event.y)
+        self.app.update_drag(gx, gy)
+        return True
+
+    def on_release(self, _w, event):
+        if event.button != 1:
+            return False
+        gx, gy = self.to_global(event.x, event.y)
+        self.app.end_drag(gx, gy)
+        return True
+
+    def on_key(self, _w, event):
+        key = Gdk.keyval_name(event.keyval)
+        if key in ("Escape", "Esc"):
+            self.app.cancel()
+            return True
+        return False
+
+    def on_draw(self, _w, cr):
+        # clear
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+
+        cr.set_operator(cairo.OPERATOR_OVER)
+        # dim whole output
+        cr.set_source_rgba(0, 0, 0, DIM)
+        cr.rectangle(0, 0, self.win_w, self.win_h)
+        cr.fill()
+
+        sel = self.app.selection_global()
+        if sel is not None:
+            x, y, w, h = sel
+            # hole in local coords
+            lx, ly = x - self.geo.x, y - self.geo.y
+            # only clear intersection with this monitor
+            cr.set_operator(cairo.OPERATOR_CLEAR)
+            cr.rectangle(lx, ly, w, h)
+            cr.fill()
+            cr.set_operator(cairo.OPERATOR_OVER)
+
+            # draw ropes in local space
+            for rope in self.app.ropes:
+                self._draw_rope(cr, rope)
+
+            # corner pins
+            cr.set_source_rgba(0.95, 0.85, 0.55, 1.0)
+            for cx, cy in ((x, y), (x + w, y), (x + w, y + h), (x, y + h)):
+                cr.arc(cx - self.geo.x, cy - self.geo.y, 3.2, 0, 2 * math.pi)
+                cr.fill()
+
+        return False
+
+    def _draw_rope(self, cr, rope: Rope):
+        """Fast pixel-rope look for border AND tethers (stroke + sparse braid ticks)."""
+        if len(rope.pts) < 2:
+            return
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+        ox, oy = self.geo.x, self.geo.y
+        C_OUT = (0.22, 0.12, 0.05, 1.0)
+        C_DARK = (0.42, 0.26, 0.12, 1.0)
+        C_MID = (0.70, 0.50, 0.28, 1.0)
+        C_LIT = (0.90, 0.74, 0.48, 1.0)
+        cell = 3
+        thick = 7 if rope.kind == "border" else 6
+
+        def path():
+            cr.move_to(rope.pts[0].x - ox, rope.pts[0].y - oy)
+            for p in rope.pts[1:]:
+                cr.line_to(p.x - ox, p.y - oy)
+
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        # outline
+        cr.set_line_width(thick + 2 * cell)
+        cr.set_source_rgba(*C_OUT)
+        path()
+        cr.stroke()
+        # dark core
+        cr.set_line_width(thick)
+        cr.set_source_rgba(*C_DARK)
+        path()
+        cr.stroke()
+        # mid body
+        cr.set_line_width(thick - 2)
+        cr.set_source_rgba(*C_MID)
+        path()
+        cr.stroke()
+        # light braid ticks along length (sparse = fast)
+        dist_acc = 0.0
+        step = cell * 2
+        for i in range(len(rope.pts) - 1):
+            a, b = rope.pts[i], rope.pts[i + 1]
+            dx, dy = b.x - a.x, b.y - a.y
+            seg = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / seg, dy / seg
+            nx, ny = -uy, ux
+            t = 0.0
+            while t < seg:
+                if int((dist_acc + t) / step) != int((dist_acc + t - 0.01) / step) or t == 0:
+                    phase = int((dist_acc + t) / step)
+                    twist = 1 if (phase % 2) == 0 else -1
+                    px = a.x + ux * t - ox + nx * twist * 1.5
+                    py = a.y + uy * t - oy + ny * twist * 1.5
+                    col = C_LIT if (phase % 3) == 0 else C_MID
+                    cr.set_source_rgba(*col)
+                    cr.rectangle(round(px / cell) * cell, round(py / cell) * cell, cell, cell)
+                    cr.fill()
+                    # opposite dark fiber
+                    px2 = a.x + ux * t - ox - nx * twist * 1.5
+                    py2 = a.y + uy * t - oy - ny * twist * 1.5
+                    cr.set_source_rgba(*C_DARK)
+                    cr.rectangle(round(px2 / cell) * cell, round(py2 / cell) * cell, cell, cell)
+                    cr.fill()
+                t += step
+            dist_acc += seg
+
+        # end knots
+        for p in (rope.pts[0], rope.pts[-1]):
+            kx, ky = p.x - ox, p.y - oy
+            for dx, dy, col in (
+                (0, 0, C_OUT),
+                (-cell, 0, C_DARK),
+                (cell, 0, C_MID),
+                (0, -cell, C_DARK),
+                (0, cell, C_LIT),
+            ):
+                cr.set_source_rgba(*col)
+                cr.rectangle(round((kx + dx) / cell) * cell, round((ky + dy) / cell) * cell, cell, cell)
+                cr.fill()
+
+
+class ScreenshotApp:
+    def __init__(self):
+        self.dragging = False
+        self.x0 = self.y0 = 0.0
+        self.x1 = self.y1 = 0.0
+        self.ropes: list[Rope] = []
+        self.windows: list[ScreenOverlay] = []
+        self._last = time.monotonic()
+        self._done = False
+
+        display = Gdk.Display.get_default()
+        n = display.get_n_monitors()
+        for i in range(n):
+            mon = display.get_monitor(i)
+            geo = mon.get_geometry()
+            win = ScreenOverlay(self, mon, geo)
+            self.windows.append(win)
+        # Escape handling on the first overlay
+        if self.windows:
+            GtkLayerShell.set_keyboard_mode(
+                self.windows[0], GtkLayerShell.KeyboardMode.EXCLUSIVE
+            )
+            self.windows[0].grab_focus()
+
+        GLib.timeout_add(5, self._tick)  # ~200Hz physics + draw
+
+    def selection_global(self):
+        if not self.dragging and abs(self.x1 - self.x0) < 1 and abs(self.y1 - self.y0) < 1:
+            # idle before first drag — no selection
+            if self.x0 == 0 and self.x1 == 0 and self.y0 == 0 and self.y1 == 0:
+                return None
+        x = min(self.x0, self.x1)
+        y = min(self.y0, self.y1)
+        w = abs(self.x1 - self.x0)
+        h = abs(self.y1 - self.y0)
+        if w < 1 or h < 1:
+            return None
+        return int(x), int(y), int(w), int(h)
+
+    def _monitor_for_sel(self, sel):
+        cx = sel[0] + sel[2] / 2
+        cy = sel[1] + sel[3] / 2
+        for win in self.windows:
+            g = win.geo
+            if g.x <= cx < g.x + g.width and g.y <= cy < g.y + g.height:
+                return g
+        return self.windows[0].geo if self.windows else None
+
+    def _rope_specs(self, sel):
+        """Tethers ONLY to rect corners; border ropes almost taut with light motion."""
+        x, y, w, h = sel
+        g = self._monitor_for_sel(sel)
+        if g is None:
+            return []
+        mx, my, mw, mh = g.x, g.y, g.width, g.height
+        specs = []
+
+        # One tether per corner: monitor corner → selection corner
+        specs.append(("tether", mx, my, x, y, SEGMENTS_TETHER, GRAVITY_TETHER, SLACK_TETHER))  # TL
+        specs.append(("tether", mx + mw, my, x + w, y, SEGMENTS_TETHER, GRAVITY_TETHER, SLACK_TETHER))  # TR
+        specs.append(("tether", mx + mw, my + mh, x + w, y + h, SEGMENTS_TETHER, GRAVITY_TETHER, SLACK_TETHER))  # BR
+        specs.append(("tether", mx, my + mh, x, y + h, SEGMENTS_TETHER, GRAVITY_TETHER, SLACK_TETHER))  # BL
+
+        # Perimeter: top/bottom normal stiff; left/right extra-taut ("сбоку посильнее")
+        specs.append(("border", x, y, x + w, y, SEGMENTS_BORDER, GRAVITY_BORDER, SLACK_BORDER))  # top
+        specs.append(("border", x + w, y + h, x, y + h, SEGMENTS_BORDER, GRAVITY_BORDER, SLACK_BORDER))  # bottom
+        specs.append(("border", x + w, y, x + w, y + h, SEGMENTS_BORDER, GRAVITY_SIDE, SLACK_SIDE))  # right
+        specs.append(("border", x, y + h, x, y, SEGMENTS_BORDER, GRAVITY_SIDE, SLACK_SIDE))  # left
+        return specs
+
+    def _sync_ropes(self):
+        sel = self.selection_global()
+        if sel is None:
+            self.ropes = []
+            return
+        specs = self._rope_specs(sel)
+        if len(self.ropes) != len(specs):
+            self.ropes = [
+                make_rope(x0, y0, x1, y1, n=n, gravity=grav, slack=slack, kind=kind)
+                for kind, x0, y0, x1, y1, n, grav, slack in specs
+            ]
+        else:
+            for rope, (kind, x0, y0, x1, y1, _n, grav, slack) in zip(self.ropes, specs):
+                rope.kind = kind
+                rope.gravity = grav
+                update_rope_ends(rope, x0, y0, x1, y1, slack)
+
+    def begin_drag(self, gx, gy):
+        self.dragging = True
+        self.x0 = self.x1 = gx
+        self.y0 = self.y1 = gy
+        self.ropes = []
+        self._sync_ropes()
+        self.redraw(all_monitors=True)
+
+    def update_drag(self, gx, gy):
+        self.x1, self.y1 = gx, gy
+        self._sync_ropes()
+        self.redraw()
+        self._last_draw = time.monotonic()
+
+    def end_drag(self, gx, gy):
+        self.x1, self.y1 = gx, gy
+        self.dragging = False
+        self._sync_ropes()
+        sel = self.selection_global()
+        if sel is None or sel[2] < MIN_SIZE or sel[3] < MIN_SIZE:
+            self.cancel()
+            return
+        # hide overlays so they aren't in the shot / recorder
+        for w in self.windows:
+            w.hide()
+        if GEOMETRY_ONLY:
+            x, y, w, h = sel
+            print(f"{x},{y} {w}x{h}", flush=True)
+            self._done = True
+            Gtk.main_quit()
+            return
+        # let compositor catch up
+        GLib.timeout_add(60, lambda: self._capture(sel) or False)
+
+    def _capture(self, sel):
+        if self._done:
+            return False
+        self._done = True
+        x, y, w, h = sel
+        os.makedirs(OUTDIR, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H-%M-%S")
+        path = os.path.join(OUTDIR, f"Screenshot from {stamp}.png")
+        geom = f"{x},{y} {w}x{h}"
+        try:
+            subprocess.run(["grim", "-g", geom, path], check=True)
+            with open(path, "rb") as f:
+                subprocess.run(
+                    ["wl-copy", "--type", "image/png"],
+                    input=f.read(),
+                    check=False,
+                )
+            subprocess.run(
+                ["notify-send", "-a", "Screenshot", "Скриншот сохранён", path],
+                check=False,
+            )
+        except Exception as e:
+            subprocess.run(
+                ["notify-send", "-a", "Screenshot", "Ошибка скриншота", str(e)],
+                check=False,
+            )
+        Gtk.main_quit()
+        return False
+
+    def cancel(self):
+        if self._done:
+            return
+        self._done = True
+        self._cancelled = True
+        Gtk.main_quit()
+
+    def redraw(self, all_monitors: bool = False):
+        if all_monitors:
+            for w in self.windows:
+                w.queue_draw()
+            return
+        sel = self.selection_global()
+        g = self._monitor_for_sel(sel) if sel else None
+        for w in self.windows:
+            if g is None or (
+                w.geo.x == g.x and w.geo.y == g.y and w.geo.width == g.width and w.geo.height == g.height
+            ):
+                w.queue_draw()
+
+    def _tick(self):
+        if self._done:
+            return False
+        now = time.monotonic()
+        dt = min(now - self._last, 0.01)
+        self._last = now
+        if self.ropes:
+            for rope in self.ropes:
+                step_rope(rope, dt)
+            # target ~200fps redraw on active monitor
+            if not hasattr(self, "_last_draw"):
+                self._last_draw = 0.0
+            if now - self._last_draw >= (1 / 200):
+                self._last_draw = now
+                self.redraw()
+        return True
+
+
+def main() -> int:
+    if not GEOMETRY_ONLY:
+        os.makedirs(OUTDIR, exist_ok=True)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    app = ScreenshotApp()
+    app._cancelled = False
+    Gtk.main()
+    if GEOMETRY_ONLY and getattr(app, "_cancelled", False):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

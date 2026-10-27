@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+directory="${NAUTILUS_SCRIPT_CURRENT_URI:-}"
+if [[ "$directory" == file://* ]]; then
+    directory="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1][7:]))' "$directory")"
+fi
+
+if [[ -n "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}" ]]; then
+    selected="$(printf '%s\n' "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" | sed -n '1p')"
+    if [[ -d "$selected" ]]; then
+        directory="$selected"
+    elif [[ -n "$selected" ]]; then
+        directory="$(dirname -- "$selected")"
+    fi
+fi
+
+[[ -d "$directory" ]] || directory="$HOME"
+exec kitty --working-directory="$directory"

@@ -1,0 +1,2 @@
+com.obsproject.Studio
+org.blender.Blender
